@@ -193,9 +193,10 @@ class AppConfig:
             if value is not None:
                 setattr(cls, key, value)
 
-def update_headers(request: Request, user: str) -> Request:
+def update_headers(request: Request, new_api_key: str = None, user: str = None) -> Request:
     new_headers = request.headers.mutablecopy()
-    del new_headers["Authorization"]
+    if new_api_key:
+        new_headers["authorization"] = f"Bearer {new_api_key}"
     if user:
         new_headers["x-user"] = user
     request.scope["headers"] = new_headers.raw
@@ -228,7 +229,7 @@ class Api:
 
     def register_authorization(self):
         if AppConfig.g4f_api_key:
-            print(f"Register authentication key: {''.join(['*' for _ in range(len(AppConfig.g4f_api_key))])}")
+            print("Register authentication key:", ''.join(['*' for _ in range(len(AppConfig.g4f_api_key))]))
         if has_crypto:
             private_key, _ = create_or_read_keys()
             session_key = get_session_key()
@@ -236,23 +237,26 @@ class Api:
         async def authorization(request: Request, call_next):
             user = None
             if request.method != "OPTIONS" and AppConfig.g4f_api_key is not None or AppConfig.demo:
+                update_authorization = False
                 try:
                     user_g4f_api_key = await self.get_g4f_api_key(request)
                 except HTTPException:
-                    user_g4f_api_key = await self.security(request)
-                    user_g4f_api_key = getattr(user_g4f_api_key, "credentials", user_g4f_api_key)
+                    user_g4f_api_key = getattr(await self.security(request), "credentials", None)
+                    update_authorization = True
+                if user_g4f_api_key:
+                    user_g4f_api_key = user_g4f_api_key.split()
                 country = request.headers.get("Cf-Ipcountry", "")
                 if AppConfig.demo and user is None:
                     ip = request.headers.get("X-Forwarded-For", "")[:4].strip(":.")
                     user = request.headers.get("x-user", ip)
                     user = f"{country}:{user}" if country else user
-                if AppConfig.g4f_api_key is None or not user_g4f_api_key or not secrets.compare_digest(AppConfig.g4f_api_key, user_g4f_api_key):
+                if AppConfig.g4f_api_key is None or not user_g4f_api_key or not secrets.compare_digest(AppConfig.g4f_api_key, user_g4f_api_key[0]):
                     if has_crypto and user_g4f_api_key:
                         try:
-                            expires, user = decrypt_data(private_key, user_g4f_api_key).split(":", 1)
+                            expires, user = decrypt_data(private_key, user_g4f_api_key[0]).split(":", 1)
                         except:
                             try:
-                                data = json.loads(decrypt_data(session_key, user_g4f_api_key))
+                                data = json.loads(decrypt_data(session_key, user_g4f_api_key[0]))
                                 debug.log(f"Decrypted G4F API key data: {data}")
                                 expires = int(decrypt_data(private_key, data.pop("data"))) + 86400
                                 user = data.get("user", user)
@@ -280,12 +284,12 @@ class Api:
                 path = request.url.path
                 if path.startswith("/v1") or path.startswith("/api/") or (AppConfig.demo and path == '/backend-api/v2/upload_cookies'):
                     if request.method != "OPTIONS" and not path.endswith("/models"):
-                        if user_g4f_api_key is None:
+                        if not user_g4f_api_key:
                             return ErrorResponse.from_message("G4F API key required", HTTP_401_UNAUTHORIZED)
                         if AppConfig.g4f_api_key is None and user is None:
                             return ErrorResponse.from_message("Invalid G4F API key", HTTP_403_FORBIDDEN)
                 elif not AppConfig.demo and not path.startswith("/images/") and not path.startswith("/media/"):
-                    if user_g4f_api_key is not None:
+                    if user_g4f_api_key:
                         if user is None:
                             return ErrorResponse.from_message("Invalid G4F API key", HTTP_403_FORBIDDEN)
                     elif path.startswith("/backend-api/") or path.startswith("/chat/"):
@@ -293,7 +297,11 @@ class Api:
                             user = await self.get_username(request)
                         except HTTPException as e:
                             return ErrorResponse.from_message(e.detail, e.status_code, e.headers)
-                request = update_headers(request, user)
+                if user_g4f_api_key and update_authorization:
+                    new_api_key = user_g4f_api_key.pop()
+                else:
+                    new_api_key = None
+                request = update_headers(request, new_api_key, user)
             response = await call_next(request)
             return response
 
@@ -418,8 +426,6 @@ class Api:
                 })
             return ErrorResponse.from_message("The model does not exist.", HTTP_404_NOT_FOUND)
 
-        most_wanted = {}
-        failure_counts = {}
         responses = {
             HTTP_200_OK: {"model": ChatCompletion},
             HTTP_401_UNAUTHORIZED: {"model": ErrorResponseModel},
@@ -436,29 +442,7 @@ class Api:
             provider: str = None,
             conversation_id: str = None,
             x_user: Annotated[str | None, Header()] = None,
-            cf_ipcountry: Annotated[str | None, Header()] = None,
-            x_forwarded_for: Annotated[str | None, Header()] = None
         ):
-            if AppConfig.demo and x_forwarded_for is not None:
-                current_most_wanted = next(iter(most_wanted.values()), 0)
-                is_most_wanted = False
-                if x_forwarded_for in most_wanted:
-                    if failure_counts.get(x_forwarded_for, 0) > 1:
-                        failure_counts[x_forwarded_for] -= 1
-                        most_wanted[x_forwarded_for] += 1
-                    elif most_wanted[x_forwarded_for] >= current_most_wanted:
-                        if x_forwarded_for not in failure_counts:
-                            failure_counts[x_forwarded_for] = 0
-                        failure_counts[x_forwarded_for] += 1
-                        is_most_wanted = True
-                    else:
-                        most_wanted[x_forwarded_for] += 1
-                else:
-                    most_wanted[x_forwarded_for] = 1
-                sorted_most_wanted = dict(sorted(most_wanted.items(), key=lambda item: item[1], reverse=True))
-                print(f"Most wanted IPs: {json.dumps(sorted_most_wanted, indent=2)}")
-                if is_most_wanted:
-                    return ErrorResponse.from_message("You are most wanted! Please wait before making another request.", status_code=HTTP_429_TOO_MANY_REQUESTS)
             if provider is not None and provider not in Provider.__map__:
                 if provider in model_map:
                     config.model = provider
@@ -511,7 +495,7 @@ class Api:
                             **{
                                 "conversation_id": None,
                                 "conversation": conversation,
-                                "user": f"{cf_ipcountry}:{x_user}" if cf_ipcountry else x_user,
+                                "user": x_user,
                             }
                         },
                         ignored=AppConfig.ignored_providers

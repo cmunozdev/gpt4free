@@ -50,7 +50,12 @@ class CookiesConfig:
 class BrowserConfig:
     port: int = None
     host: str = "127.0.0.1"
-    stop_browser = lambda: None
+    impersonate: str = "chrome"
+    
+    @staticmethod
+    def stop_browser():
+        return None
+    
     browser_executable_path: str = None
 
 DOMAINS = (
@@ -195,6 +200,7 @@ def read_cookie_files(dir_path: Optional[str] = None, domains_filter: Optional[L
     if BrowserConfig.port:
         BrowserConfig.port = int(BrowserConfig.port)
         debug.log(f"Using browser: {BrowserConfig.host}:{BrowserConfig.port}")
+    BrowserConfig.impersonate = os.environ.get("G4F_BROWSER_IMPERSONATE", BrowserConfig.impersonate)
 
     har_files, json_files = [], []
     for root, _, files in os.walk(dir_path):
